@@ -164,6 +164,8 @@ def place_bracket_order(direction: str, qty: int, stop: float, target: float) ->
         "stop_loss": {"stop_price": str(round(stop, 2))},
     }
     resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
+    if resp.status_code >= 400:
+        log.error("Alpaca rejected the order (status %d): %s", resp.status_code, resp.text)
     resp.raise_for_status()
     return resp.json()
 
