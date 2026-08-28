@@ -1,0 +1,20 @@
+name: ORB 5min Check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 13-21 * * 1-5"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install requests pandas
+      - run: python orb_live_bot.py
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
