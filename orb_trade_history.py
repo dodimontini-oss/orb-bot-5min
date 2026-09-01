@@ -4,11 +4,19 @@ and orb-bot-15min - identical script, deployed to both repos, each reading
 its own Alpaca paper account via that repo's own secrets).
 
 Read-only: reads Alpaca's own position and order records, prints a summary.
-No orders are placed. Alpaca reports fills, not matched round-trip trades -
-for a bracket order (entry + stop + target placed together), the CLOSING
-leg's fill tells you whether the trade hit its stop or its target: a filled
-leg whose price is close to the ORIGINAL entry order's stop_loss.stop_price
-was a loser, close to take_profit.limit_price was a winner.
+No orders are placed.
+
+IMPORTANT correctness note (learned the hard way on the first version of
+this script): every ORB entry is a BRACKET order (order_class="bracket").
+Alpaca nests the stop/target CHILD legs inside the parent entry order's
+"legs" field - they do NOT appear as separate top-level fills in
+GET /v2/orders. A naive "pair the Nth fill with the (N+1)th same-symbol
+fill" heuristic is WRONG here: two independent entries for the same symbol
+(e.g. a stopped-out short followed by an unrelated new long) look identical
+to a real entry->exit pair, and get silently mis-paired into a fake P&L.
+This version reads each entry's OWN nested legs to find its real exit
+(whichever leg has status="filled"), so pairing is by actual parent/child
+relationship, never by chronological guesswork.
 
 Environment variables required:
     ALPACA_API_KEY
@@ -42,10 +50,11 @@ def get_positions() -> list:
 
 
 def get_all_orders() -> list:
-    """ALL orders (filled, canceled, rejected, open) newest-first from
-    Alpaca, re-sorted chronologically below - rejected/canceled orders are
-    kept in the report since a missed/failed entry is exactly the kind of
-    pattern this report needs to surface, not just the successful trades."""
+    """Top-level orders only, newest-first from Alpaca, re-sorted
+    chronologically below. nested=true so each bracket entry's stop/target
+    child legs come back attached in "legs" rather than as separate
+    top-level entries (which would otherwise let a leg fill get mistaken
+    for an unrelated new entry)."""
     params = {"status": "all", "limit": 500, "direction": "desc", "nested": "true"}
     resp = requests.get(f"{ALPACA_BASE_URL}/v2/orders", headers=HEADERS, params=params, timeout=15)
     resp.raise_for_status()
@@ -53,18 +62,16 @@ def get_all_orders() -> list:
     return sorted(orders, key=lambda o: o.get("submitted_at") or o.get("created_at") or "")
 
 
-def describe_bracket(o: dict) -> str:
-    """For a bracket entry order, show its stop/target legs so a later fill
-    can be matched to 'hit stop' vs 'hit target' by eye."""
-    legs = o.get("legs") or []
-    parts = []
-    for leg in legs:
-        lt = leg.get("type")
-        if lt == "stop":
-            parts.append(f"stop={leg.get('stop_price')}")
-        elif lt == "limit":
-            parts.append(f"target={leg.get('limit_price')}")
-    return f" [{', '.join(parts)}]" if parts else ""
+def find_filled_leg(order: dict):
+    """Returns (kind, leg_dict) for whichever bracket child leg has
+    actually filled - 'target' (take_profit/limit) or 'stop'
+    (stop_loss/stop) - or (None, None) if neither has filled yet (position
+    still open, or the entry itself never filled)."""
+    for leg in order.get("legs") or []:
+        if leg.get("status") == "filled":
+            kind = "target" if leg.get("type") == "limit" else "stop"
+            return kind, leg
+    return None, None
 
 
 def run():
@@ -73,6 +80,7 @@ def run():
 
     positions = get_positions()
     orders = get_all_orders()
+    entries = [o for o in orders if o.get("order_class") == "bracket"]
 
     print(f"\nAlpaca account summary: equity=${equity:.2f}\n")
 
@@ -90,61 +98,60 @@ def run():
         print(f"  [{symbol}] {side.upper():<5} qty={qty} @ {entry:.2f} -> current {current:.2f} "
               f"| unrealized P/L={upl:+.2f} ({upl_pct:+.1f}%)")
 
-    print(f"\n=== ALL ORDERS ({len(orders)}) - chronological, newest last ===")
-    if not orders:
+    print(f"\n=== BRACKET ENTRIES ({len(entries)}) - chronological, each with its own real exit ===")
+    if not entries:
         print("  (none)")
-    filled = rejected = canceled = 0
+    filled_entries = rejected_entries = closed_trades = wins = losses = 0
     realized_pl = 0.0
-    entry_prices = {}  # symbol -> (side, qty, entry_price) for the currently-open leg
-    for o in orders:
+    for o in entries:
         symbol = o["symbol"]
         side = o["side"]
         status = o["status"]
-        order_class = o.get("order_class", "")
         qty = o.get("filled_qty") or o.get("qty")
-        avg_price = float(o["filled_avg_price"]) if o.get("filled_avg_price") else None
-        ts = (o.get("filled_at") or o.get("submitted_at") or o.get("created_at") or "?")[:19]
-        bracket_info = describe_bracket(o) if order_class == "bracket" else ""
+        entry_price = float(o["filled_avg_price"]) if o.get("filled_avg_price") else None
+        ts = (o.get("filled_at") or o.get("submitted_at") or "?")[:19]
 
-        if status == "filled":
-            filled += 1
-        elif status == "rejected":
-            rejected += 1
-        elif status in ("canceled", "expired"):
-            canceled += 1
+        legs = o.get("legs") or []
+        stop_price = next((leg.get("stop_price") for leg in legs if leg.get("type") == "stop"), None)
+        target_price = next((leg.get("limit_price") for leg in legs if leg.get("type") == "limit"), None)
 
-        price_str = f"{avg_price:.2f}" if avg_price is not None else "-"
-        print(f"  [{symbol}] {side.upper():<4} {status:<10} qty={qty} @ {price_str} "
-              f"{ts}{bracket_info}")
+        if status == "rejected" or o.get("failed_at"):
+            rejected_entries += 1
+            print(f"  [{symbol}] {side.upper():<4} REJECTED/FAILED - no fill, no trade taken. "
+                  f"submitted {ts}")
+            continue
+        if status != "filled" or entry_price is None:
+            print(f"  [{symbol}] {side.upper():<4} {status:<10} (entry did not fill) submitted {ts}")
+            continue
 
-        if o.get("failed_at") or status == "rejected":
-            reason = o.get("cancel_requested_at") or ""
-            print(f"      -> REJECTED/FAILED (no fill)")
+        filled_entries += 1
+        print(f"  [{symbol}] {side.upper():<4} ENTRY filled qty={qty} @ {entry_price:.2f} {ts} "
+              f"[stop={stop_price}, target={target_price}]")
 
-        if status == "filled" and avg_price is not None:
-            if symbol not in entry_prices:
-                entry_prices[symbol] = (side, float(qty), avg_price)
-            else:
-                open_side, open_qty, open_price = entry_prices.pop(symbol)
-                closing_side = side
-                if open_side == "buy" and closing_side == "sell":
-                    pnl = (avg_price - open_price) * open_qty
-                elif open_side == "sell" and closing_side == "buy":
-                    pnl = (open_price - avg_price) * open_qty
-                else:
-                    pnl = None
-                if pnl is not None:
-                    realized_pl += pnl
-                    print(f"      -> closed trade: entry {open_price:.2f} -> exit {avg_price:.2f} "
-                          f"= {pnl:+.2f}")
+        kind, leg = find_filled_leg(o)
+        if kind is None:
+            print(f"      -> still open (neither stop nor target has filled) - see OPEN POSITIONS above")
+            continue
+
+        exit_price = float(leg["filled_avg_price"])
+        exit_ts = (leg.get("filled_at") or "?")[:19]
+        direction = 1 if side == "buy" else -1
+        pnl = (exit_price - entry_price) * float(qty) * direction
+        realized_pl += pnl
+        closed_trades += 1
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+        print(f"      -> exit: {kind.upper()} hit @ {exit_price:.2f} {exit_ts}  =  {pnl:+.2f}")
 
     print(f"\n=== SUMMARY ===")
-    print(f"Orders: {len(orders)} total - filled={filled} rejected={rejected} canceled/expired={canceled}")
+    print(f"Bracket entries: {len(entries)} total - filled={filled_entries} rejected/failed={rejected_entries}")
+    print(f"Closed trades (stop or target actually hit): {closed_trades}  (wins={wins} losses={losses})")
+    if closed_trades:
+        print(f"Win rate: {wins / closed_trades * 100:.1f}%")
+    print(f"Realized P/L from closed trades: {realized_pl:+.2f}")
     print(f"Open positions: {len(positions)}")
-    print(f"Approx realized P/L from matched entry->exit pairs above: {realized_pl:+.2f}")
-    if entry_prices:
-        print(f"Note: {len(entry_prices)} symbol(s) have an unmatched open leg (still-open position or "
-              f"an odd number of fills) - see OPEN POSITIONS above for the current live figure.")
     print()
 
 
