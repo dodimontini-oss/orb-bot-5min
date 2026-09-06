@@ -42,6 +42,26 @@ Rules (exactly matching the validated backtest):
    run (see feedback_github_actions_deployment memory - cron firing isn't
    perfectly reliable) still gets multiple 5-minute chances to catch it
    before the session actually ends.
+6. RELATIVE-VOLUME CONFLUENCE FILTER (REL_VOL_THRESHOLD) - added
+   2026-09-06 after a bug fix to the backtest (same-day stop/target
+   resolution - see orb_weekend_and_stop_lab.py) revealed BASELINE
+   (no filter) has NEGATIVE expectancy on the 5-minute timeframe under a
+   more faithful model (PF 0.973 full-history), while adding this filter
+   recovers a real, walk-forward-validated edge (PF 1.232 full-history,
+   >1.0 in BOTH the early and late half - see project_orb_futures_
+   strategy_findings memory, 2026-09-06 entry). Skips the entry if
+   today's opening-range volume is below REL_VOL_THRESHOLD x the trailing
+   REL_VOL_LOOKBACK_DAYS sessions' average volume for that same opening
+   slot (exact definition matches orb_backtest_lab.py's relvol filter).
+   SET DIFFERENTLY PER REPO, same as ORB_WINDOW_MINUTES:
+   orb-bot-5min uses REL_VOL_THRESHOLD=1.5 (this is the config that fixes
+   it); orb-bot-15min uses REL_VOL_THRESHOLD=None (disabled) because its
+   own BASELINE already has solidly positive, walk-forward-validated
+   edge and the filter would only trade away most of its return for a
+   smaller drawdown improvement - not worth it there. A None threshold
+   makes relvol_ok() always return True (a complete no-op), so this is
+   the only other line that differs between the two repos' copies of
+   this file besides ORB_WINDOW_MINUTES itself.
 
 Checks EVERY bar since the range closed each run (not just the latest), so
 an occasional missed/delayed GitHub Actions run doesn't cause a missed
@@ -61,7 +81,7 @@ Environment variables required:
 
 import logging
 import os
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -80,9 +100,11 @@ HEADERS = {
 }
 
 SYMBOL = "QQQ"
-ORB_WINDOW_MINUTES = 5  # the only line that differs between orb-bot-5min and orb-bot-15min
+ORB_WINDOW_MINUTES = 5  # differs between orb-bot-5min (5) and orb-bot-15min (15)
 RR_RATIO = 2.0
 RISK_PER_TRADE_PCT = 1.0
+REL_VOL_THRESHOLD = 1.5  # differs: 1.5 here (5min), None on orb-bot-15min (disabled) - see docstring point 6
+REL_VOL_LOOKBACK_DAYS = 20
 
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
@@ -129,6 +151,76 @@ def get_today_bars() -> pd.DataFrame:
     df["time_et"] = df["t"].dt.tz_convert(ET)
     df["hm"] = df["time_et"].dt.strftime("%H:%M")
     return df.sort_values("t").reset_index(drop=True)
+
+
+def get_recent_bars(days_back: int) -> pd.DataFrame:
+    """5-min bars from `days_back` calendar days ago through now, paginated.
+    Only called when REL_VOL_THRESHOLD is set - wide enough (net of
+    weekends/holidays) to comfortably cover REL_VOL_LOOKBACK_DAYS full
+    trading sessions for the relative-volume filter."""
+    now_et = datetime.now(ET)
+    start = (now_et - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
+    all_rows = []
+    page_token = None
+    while True:
+        params = {
+            "timeframe": "5Min",
+            "start": start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": 10000,
+            "feed": "iex",
+        }
+        if page_token:
+            params["page_token"] = page_token
+        resp = requests.get(f"{DATA_BASE_URL}/v2/stocks/{SYMBOL}/bars", headers=HEADERS, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        all_rows.extend(data.get("bars", []))
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows)
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    df["time_et"] = df["t"].dt.tz_convert(ET)
+    df["session_date"] = df["time_et"].dt.date
+    df["hm"] = df["time_et"].dt.strftime("%H:%M")
+    return df.sort_values("t").reset_index(drop=True)
+
+
+def relvol_ok(today_orb_volume: float, today_session_date) -> bool:
+    """True if REL_VOL_THRESHOLD is None (filter disabled - orb-bot-15min)
+    or today's opening-range volume is >= REL_VOL_THRESHOLD x the trailing
+    REL_VOL_LOOKBACK_DAYS sessions' average opening-range volume (same
+    slot) - matches orb_backtest_lab.py's relvol filter exactly. Fails
+    SAFE (returns False, skipping the entry) on any data problem rather
+    than trading without the filter it was asked to apply."""
+    if REL_VOL_THRESHOLD is None:
+        return True
+    hist = get_recent_bars(days_back=REL_VOL_LOOKBACK_DAYS * 2 + 10)
+    if hist.empty:
+        log.warning("relvol filter: no historical bars returned - failing safe (skipping entry).")
+        return False
+    orb_end_hm = _orb_end_hm(ORB_WINDOW_MINUTES)
+    past_sessions = sorted(s for s in hist["session_date"].unique() if s < today_session_date)
+    past_sessions = past_sessions[-REL_VOL_LOOKBACK_DAYS:]
+    if len(past_sessions) < 5:
+        log.warning("relvol filter: only %d prior session(s) available (<5) - failing safe (skipping entry).",
+                     len(past_sessions))
+        return False
+    past_vols = []
+    for s in past_sessions:
+        day_bars = hist[(hist["session_date"] == s) & (hist["hm"] >= "09:30") & (hist["hm"] <= orb_end_hm)]
+        if not day_bars.empty:
+            past_vols.append(day_bars["volume"].sum())
+    if not past_vols:
+        return False
+    avg_vol = sum(past_vols) / len(past_vols)
+    ratio = (today_orb_volume / avg_vol) if avg_vol > 0 else 0
+    log.info("relvol check: today's opening volume=%.0f, %d-session avg=%.0f, ratio=%.2fx (need >= %.1fx)",
+              today_orb_volume, len(past_vols), avg_vol, ratio, REL_VOL_THRESHOLD)
+    return avg_vol > 0 and ratio >= REL_VOL_THRESHOLD
 
 
 def get_position():
@@ -264,6 +356,12 @@ def check_and_trade():
     if direction is None:
         log.info("No confirmed breakout yet (range high=%.2f low=%.2f, latest close=%.2f). No action.",
                   range_high, range_low, rest.iloc[-1]["close"])
+        return
+
+    if not relvol_ok(orb_bars["volume"].sum(), datetime.now(ET).date()):
+        log.info("%s breakout confirmed (range high=%.2f low=%.2f) but relative-volume confluence filter "
+                  "failed - skipping (see docstring point 6 / project_orb_futures_strategy_findings memory).",
+                  direction, range_high, range_low)
         return
 
     entry_ref = rest.iloc[-1]["close"]  # reference for sizing/target only - actual fill is the live market price
