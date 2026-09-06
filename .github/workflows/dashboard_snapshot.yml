@@ -2,6 +2,9 @@ name: Dashboard Snapshot (manual)
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'dashboard_trigger.txt'
 
 jobs:
   snapshot:
