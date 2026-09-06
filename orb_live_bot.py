@@ -22,11 +22,26 @@ Rules (exactly matching the validated backtest):
    fill price). Target = entry +/- 2x that risk distance (2:1 R:R).
 4. Enter with a real Alpaca BRACKET order (entry + stop + target in one
    call, time_in_force=GTC so the protective legs stay live even if the
-   position carries past today's close - matches the backtest's "no
-   session-close flatten" rule). QQQ is a stock, so - unlike the crypto
-   bot - this gets a REAL broker-side stop-loss, no virtual stop-checking
-   workaround needed. Alpaca supports short selling for stocks too, so
-   both LONG and SHORT signals are traded live, matching the backtest.
+   position carries past today's close). QQQ is a stock, so - unlike the
+   crypto bot - this gets a REAL broker-side stop-loss, no virtual
+   stop-checking workaround needed. Alpaca supports short selling for
+   stocks too, so both LONG and SHORT signals are traded live, matching
+   the backtest.
+5. EXCEPTION to "no session-close flatten" - Friday-flatten-if-profitable
+   (added 2026-09-06, see orb_weekend_and_stop_lab.py /
+   project_orb_futures_strategy_findings memory): on a Friday, inside
+   FRIDAY_FLATTEN_START-MARKET_CLOSE ET, if still holding a position AND
+   its unrealized_pl is positive, cancel the resting bracket legs and
+   close it at market instead of letting it ride through the weekend.
+   Backtested to beat plain hold-through on every metric (PF, net P&L%,
+   max drawdown), walk-forward validated on both timeframes - this is NOT
+   a discretionary override, it's a validated rule. Losing positions are
+   NOT touched by this - they keep riding the normal bracket stop/target
+   exactly as before. The window is 30 minutes wide (not just the literal
+   last tick) specifically so an occasional missed/delayed GitHub Actions
+   run (see feedback_github_actions_deployment memory - cron firing isn't
+   perfectly reliable) still gets multiple 5-minute chances to catch it
+   before the session actually ends.
 
 Checks EVERY bar since the range closed each run (not just the latest), so
 an occasional missed/delayed GitHub Actions run doesn't cause a missed
@@ -73,6 +88,7 @@ ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
+FRIDAY_FLATTEN_START = dtime(15, 30)  # last 30 min of a Friday session - see docstring point 5
 
 
 def market_is_open_now() -> bool:
@@ -170,6 +186,25 @@ def place_bracket_order(direction: str, qty: int, stop: float, target: float) ->
     return resp.json()
 
 
+def flatten_position(position: dict) -> dict:
+    """Cancel any resting bracket legs (a bare closing order can otherwise
+    get rejected - Alpaca reserves qty against open sell/buy-to-cover
+    orders) then submit a plain market order to close the position."""
+    for order in get_open_orders():
+        del_resp = requests.delete(f"{TRADING_BASE_URL}/v2/orders/{order['id']}", headers=HEADERS, timeout=10)
+        if del_resp.status_code >= 400:
+            log.error("Failed to cancel resting order %s (status %d): %s",
+                       order["id"], del_resp.status_code, del_resp.text)
+    qty = abs(float(position["qty"]))
+    side = "sell" if position["side"] == "long" else "buy"
+    body = {"symbol": SYMBOL, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}
+    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
+    if resp.status_code >= 400:
+        log.error("Alpaca rejected the Friday-flatten close order (status %d): %s", resp.status_code, resp.text)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def check_and_trade():
     if not market_is_open_now():
         log.info("Outside regular market hours (9:30-16:00 ET, weekdays). No action.")
@@ -177,6 +212,17 @@ def check_and_trade():
 
     position = get_position()
     if position is not None and float(position["qty"]) != 0:
+        now_et = datetime.now(ET)
+        unrealized_pl = float(position.get("unrealized_pl", 0))
+        if now_et.weekday() == 4 and FRIDAY_FLATTEN_START <= now_et.time() <= MARKET_CLOSE \
+                and unrealized_pl > 0:
+            log.info("Friday-flatten window, in a position (%s %s shares, unrealized P&L $%.2f > 0) - "
+                      "closing now to lock in profit before the weekend instead of holding through it "
+                      "(validated rule, see orb_live_bot.py docstring point 5).",
+                      position["side"], position["qty"], unrealized_pl)
+            result = flatten_position(position)
+            log.info("Alpaca response: %s", result)
+            return
         log.info("Already in a position (%s %s shares). Bracket order manages the exit. No action.",
                   position["side"], position["qty"])
         return
