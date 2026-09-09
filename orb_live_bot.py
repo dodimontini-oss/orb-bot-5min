@@ -79,6 +79,11 @@ Environment variables required:
     ALPACA_SECRET_KEY
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from trading_core import execution as safety
+
 import logging
 import os
 from datetime import datetime, time as dtime, timedelta
@@ -125,10 +130,13 @@ FRIDAY_FLATTEN_START = dtime(15, 30)  # last 30 min of a Friday session - see do
 
 
 def market_is_open_now() -> bool:
-    now_et = datetime.now(ET)
-    if now_et.weekday() >= 5:  # Saturday/Sunday
+    global SESSION_CLOSE
+    broker=safety.Alpaca(TRADING_BASE_URL,HEADERS)
+    session=broker.session()
+    if session is None:
         return False
-    return MARKET_OPEN <= now_et.time() <= MARKET_CLOSE
+    opening,SESSION_CLOSE=session
+    return opening <= pd.Timestamp.now(tz="America/New_York") < SESSION_CLOSE
 
 
 def _orb_end_hm(window_minutes: int) -> str:
@@ -161,7 +169,7 @@ def get_today_bars() -> pd.DataFrame:
     df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
     df["time_et"] = df["t"].dt.tz_convert(ET)
     df["hm"] = df["time_et"].dt.strftime("%H:%M")
-    return df.sort_values("t").reset_index(drop=True)
+    return safety.closed_rth(df.sort_values("t").reset_index(drop=True))
 
 
 def get_recent_bars(days_back: int) -> pd.DataFrame:
@@ -197,7 +205,7 @@ def get_recent_bars(days_back: int) -> pd.DataFrame:
     df["time_et"] = df["t"].dt.tz_convert(ET)
     df["session_date"] = df["time_et"].dt.date
     df["hm"] = df["time_et"].dt.strftime("%H:%M")
-    return df.sort_values("t").reset_index(drop=True)
+    return safety.closed_rth(df.sort_values("t").reset_index(drop=True))
 
 
 def relvol_ok(today_orb_volume: float, today_session_date) -> bool:
@@ -270,42 +278,17 @@ def get_account_info() -> dict:
     return resp.json()
 
 
-def place_bracket_order(direction: str, qty: int, stop: float, target: float) -> dict:
-    side = "buy" if direction == "LONG" else "sell"
-    body = {
-        "symbol": SYMBOL,
-        "qty": str(qty),
-        "side": side,
-        "type": "market",
-        "time_in_force": "gtc",  # keeps the stop/target legs live even if the position carries past today's close
-        "order_class": "bracket",
-        "take_profit": {"limit_price": str(round(target, 2))},
-        "stop_loss": {"stop_price": str(round(stop, 2))},
-    }
-    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
-    if resp.status_code >= 400:
-        log.error("Alpaca rejected the order (status %d): %s", resp.status_code, resp.text)
-    resp.raise_for_status()
-    return resp.json()
+def place_bracket_order(direction: str, qty: int, stop: float, target: float, client_id=None) -> dict:
+    if client_id is None:
+        raise ValueError("Missing signal identity")
+    return safety.Alpaca(TRADING_BASE_URL,HEADERS).submit({"symbol":SYMBOL,"qty":str(qty),
+        "side":"buy" if direction=="LONG" else "sell","type":"market","time_in_force":"gtc",
+        "order_class":"bracket","take_profit":{"limit_price":str(round(target,2))},
+        "stop_loss":{"stop_price":str(round(stop,2))},"client_order_id":client_id})
 
 
 def flatten_position(position: dict) -> dict:
-    """Cancel any resting bracket legs (a bare closing order can otherwise
-    get rejected - Alpaca reserves qty against open sell/buy-to-cover
-    orders) then submit a plain market order to close the position."""
-    for order in get_open_orders():
-        del_resp = requests.delete(f"{TRADING_BASE_URL}/v2/orders/{order['id']}", headers=HEADERS, timeout=10)
-        if del_resp.status_code >= 400:
-            log.error("Failed to cancel resting order %s (status %d): %s",
-                       order["id"], del_resp.status_code, del_resp.text)
-    qty = abs(float(position["qty"]))
-    side = "sell" if position["side"] == "long" else "buy"
-    body = {"symbol": SYMBOL, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}
-    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
-    if resp.status_code >= 400:
-        log.error("Alpaca rejected the Friday-flatten close order (status %d): %s", resp.status_code, resp.text)
-    resp.raise_for_status()
-    return resp.json()
+    return safety.Alpaca(TRADING_BASE_URL,HEADERS).close(SYMBOL)
 
 
 def check_and_trade():
@@ -317,7 +300,7 @@ def check_and_trade():
     if position is not None and float(position["qty"]) != 0:
         now_et = datetime.now(ET)
         unrealized_pl = float(position.get("unrealized_pl", 0))
-        if now_et.weekday() == 4 and FRIDAY_FLATTEN_START <= now_et.time() <= MARKET_CLOSE \
+        if now_et.weekday() == 4 and pd.Timestamp(now_et) >= SESSION_CLOSE-pd.Timedelta(minutes=30) \
                 and unrealized_pl > 0:
             log.info("Friday-flatten window, in a position (%s %s shares, unrealized P&L $%.2f > 0) - "
                       "closing now to lock in profit before the weekend instead of holding through it "
@@ -344,8 +327,8 @@ def check_and_trade():
         return
 
     orb_end_hm = _orb_end_hm(ORB_WINDOW_MINUTES)
-    orb_bars = df[df["hm"] <= orb_end_hm]
-    if orb_bars.empty or orb_bars["hm"].max() < orb_end_hm:
+    orb_bars = df[(df["hm"] >= "09:30") & (df["hm"] <= orb_end_hm)]
+    if len(orb_bars) != ORB_WINDOW_MINUTES//5 or orb_bars["hm"].max() < orb_end_hm:
         log.info("Opening range not fully formed yet (need bars through %s ET). No action.", orb_end_hm)
         return
 
@@ -430,7 +413,7 @@ def check_and_trade():
 
     log.info("%s breakout confirmed (range high=%.2f low=%.2f) - placing bracket: qty=%d stop=%.2f target=%.2f",
               direction, range_high, range_low, qty, stop, target)
-    result = place_bracket_order(direction, qty, stop, target)
+    result = place_bracket_order(direction, qty, stop, target, safety.signal_id("orb"+str(ORB_WINDOW_MINUTES), SYMBOL, pd.Timestamp.now(tz="America/New_York").normalize()))
     log.info("Alpaca response: %s", result)
 
 
