@@ -103,6 +103,17 @@ SYMBOL = "QQQ"
 ORB_WINDOW_MINUTES = 5  # differs between orb-bot-5min (5) and orb-bot-15min (15)
 RR_RATIO = 2.0
 RISK_PER_TRADE_PCT = 1.0
+# Caps position notional at MAX_LEVERAGE x equity, matching a standard
+# Robinhood Gold / Reg-T margin account's OVERNIGHT buying power (2x
+# equity) - not Robinhood's 4x day-trade buying power, since that only
+# applies to intraday round trips on a PDT-flagged account and evaporates
+# by end of day; this bot holds positions overnight (GTC, no session-
+# close flatten), so 2x is the honest real-broker comparison. Added
+# 2026-09-08 after orochi_modea_live_bot.py hit a live trade sized to ~4x
+# equity (a tight stop_distance let 1%-risk sizing call for far more
+# shares than the account's buying power realistically should allow) -
+# only ever shrinks qty, same as the buying-power cap below; never grows it.
+MAX_LEVERAGE = 2.0
 REL_VOL_THRESHOLD = 1.5  # differs: 1.5 here (5min), None on orb-bot-15min (disabled) - see docstring point 6
 REL_VOL_LOOKBACK_DAYS = 20
 
@@ -405,6 +416,13 @@ def check_and_trade():
     # Only ever shrinks the position, never grows it beyond the 1%-risk size.
     max_affordable_qty = int(buying_power / entry_ref)
     qty = min(qty, max_affordable_qty)
+    # Real incident 2026-09-08 (orochi_modea_live_bot.py): a tight stop
+    # distance let risk-based sizing call for far more notional than
+    # reasonable leverage should allow, only bounded by generous paper
+    # buying power. Cap notional at MAX_LEVERAGE x equity too - same
+    # "only ever shrinks qty" safety property as the buying-power cap.
+    max_leverage_qty = int((equity * MAX_LEVERAGE) / entry_ref)
+    qty = min(qty, max_leverage_qty)
     if qty <= 0:
         log.warning("Computed qty <= 0 (risk_amount=%.2f stop_distance=%.4f buying_power=%.2f) - skipping.",
                      risk_amount, stop_distance, buying_power)
