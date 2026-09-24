@@ -2,19 +2,84 @@ name: ORB 5min Check
 
 on:
   workflow_dispatch:
+    inputs:
+      loop_minutes:
+        description: "TEST ONLY - poll for this many minutes, then stop. Leave empty for the normal one-shot manual run (smoke test)."
+        required: false
+        default: ""
   schedule:
-    - cron: "*/5 13-21 * * 1-5"
+    # A few sparse STARTS per day, each of which runs a polling loop inside one
+    # job - NOT one scheduled run per check. Measured 2026-09-23: GitHub fired the
+    # old "*/5 13-21" cron only ~2-3 times per session (median gap ~2.5h, vs 78
+    # intended), so ORB entries were hours late. Odd minutes dodge the top-of-hour
+    # load spike. The extra starts are redundancy in case GitHub drops one: the
+    # concurrency group below serializes them, and a start that lands after the
+    # day's polling window exits immediately.
+    - cron: "27 13 * * 1-5"
+    - cron: "47 13 * * 1-5"
+    - cron: "12 19 * * 1-5"
+    - cron: "47 19 * * 1-5"
+
+concurrency:
+  group: orb5-session-loop
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - run: pip install requests pandas
-      - run: python orb_live_bot.py
+
+      - name: Manual one-shot (unchanged - runs the bot's smoke test on dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.loop_minutes == ''
+        run: python orb_live_bot.py
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+      - name: Poll through the session
+        if: github.event_name == 'schedule' || inputs.loop_minutes != ''
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          LOOP_MINUTES: ${{ inputs.loop_minutes }}
+        run: |
+          set -u
+          POLL_SECONDS="${POLL_SECONDS:-60}"
+          START=$(date -u +%s)
+          if [ -n "${LOOP_MINUTES}" ]; then
+            DEADLINE=$((START + LOOP_MINUTES * 60))
+          else
+            WINDOW_OPEN=$(date -u -d "13:00" +%s)
+            SESSION_END=$(date -u -d "21:05" +%s)   # covers both EDT (close 20:00 UTC) and EST (close 21:00 UTC)
+            CAP=$((START + 345 * 60))               # stay under the runner's job time limit
+            DEADLINE=$(( SESSION_END < CAP ? SESSION_END : CAP ))
+            if [ "$START" -lt "$WINDOW_OPEN" ]; then echo "Before today's polling window - nothing to do."; exit 0; fi
+          fi
+          if [ "$START" -ge "$DEADLINE" ]; then echo "Past today's polling window - nothing to do."; exit 0; fi
+
+          echo "Polling every ${POLL_SECONDS}s until $(date -u -d @"$DEADLINE" +%H:%M:%S) UTC"
+          n=0; fails=0; alert=0
+          while [ "$(date -u +%s)" -lt "$DEADLINE" ]; do
+            n=$((n + 1))
+            # env -u: orb_live_bot.py runs its smoke test whenever GITHUB_EVENT_NAME is
+            # workflow_dispatch - a looped manual test run must run the real check instead.
+            if env -u GITHUB_EVENT_NAME python orb_live_bot.py; then
+              fails=0
+            else
+              fails=$((fails + 1))
+              echo "::warning::check #$n failed ($fails in a row) - carrying on, the next poll retries"
+              if [ "$fails" -ge 10 ]; then alert=1; fi
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          echo "Polling window over after $n checks."
+          if [ "$alert" -eq 1 ]; then
+            echo "::error::10+ consecutive failed checks happened during this window - see the warnings above."
+            exit 1
+          fi
