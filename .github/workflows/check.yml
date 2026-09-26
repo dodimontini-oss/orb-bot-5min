@@ -3,18 +3,23 @@ name: ORB 5min Check
 on:
   workflow_dispatch:
     inputs:
+      run_mode:
+        description: "smoke = one-shot broker smoke test (what a manual run always did).  session = poll through the trading session (what the external scheduler sends)."
+        type: choice
+        options:
+          - smoke
+          - session
+        default: smoke
       loop_minutes:
-        description: "TEST ONLY - poll for this many minutes, then stop. Leave empty for the normal one-shot manual run (smoke test)."
+        description: "TEST ONLY - poll for this many minutes, then stop.  Leave empty normally."
         required: false
         default: ""
   schedule:
-    # A few sparse STARTS per day, each of which runs a polling loop inside one
-    # job - NOT one scheduled run per check. Measured 2026-09-23: GitHub fired the
-    # old "*/5 13-21" cron only ~2-3 times per session (median gap ~2.5h, vs 78
-    # intended), so ORB entries were hours late. Odd minutes dodge the top-of-hour
-    # load spike. The extra starts are redundancy in case GitHub drops one: the
-    # concurrency group below serializes them, and a start that lands after the
-    # day's polling window exits immediately.
+    # FALLBACK ONLY.  The loop is normally started by an external scheduler calling workflow_dispatch with
+    # run_mode=session (GitHub does not throttle dispatches).  Measured 2026-09-24/25: these cron starts fire
+    # 3-4.5 hours LATE, so on their own they miss the open.  Kept so a day the external trigger fails still gets
+    # (late) coverage; the concurrency group serialises them with any dispatch-started loop, and a start after the
+    # window exits immediately.
     - cron: "27 13 * * 1-5"
     - cron: "47 13 * * 1-5"
     - cron: "12 19 * * 1-5"
@@ -35,15 +40,15 @@ jobs:
           python-version: "3.13"
       - run: pip install requests pandas
 
-      - name: Manual one-shot (unchanged - runs the bot's smoke test on dispatch)
-        if: github.event_name == 'workflow_dispatch' && inputs.loop_minutes == ''
+      - name: Manual one-shot (unchanged - runs the bot's smoke test on a plain manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.run_mode != 'session' && inputs.loop_minutes == ''
         run: python orb_live_bot.py
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
 
       - name: Poll through the session
-        if: github.event_name == 'schedule' || inputs.loop_minutes != ''
+        if: github.event_name == 'schedule' || inputs.run_mode == 'session' || inputs.loop_minutes != ''
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
@@ -51,13 +56,16 @@ jobs:
         run: |
           set -u
           POLL_SECONDS="${POLL_SECONDS:-60}"
+          WINDOW_OPEN_HM="${WINDOW_OPEN_HM:-13:00}"    # WINDOW_/SESSION_/CAP_ overrides exist only for the offline tests
+          SESSION_END_HM="${SESSION_END_HM:-21:05}"    # 21:05 UTC covers both EDT (close 20:00 UTC) and EST (close 21:00 UTC)
+          CAP_MINUTES="${CAP_MINUTES:-345}"            # stay under the runner's 360-minute job limit
           START=$(date -u +%s)
-          if [ -n "${LOOP_MINUTES}" ]; then
+          if [ -n "${LOOP_MINUTES:-}" ]; then
             DEADLINE=$((START + LOOP_MINUTES * 60))
           else
-            WINDOW_OPEN=$(date -u -d "13:00" +%s)
-            SESSION_END=$(date -u -d "21:05" +%s)   # covers both EDT (close 20:00 UTC) and EST (close 21:00 UTC)
-            CAP=$((START + 345 * 60))               # stay under the runner's job time limit
+            WINDOW_OPEN=$(date -u -d "${WINDOW_OPEN_HM}" +%s)
+            SESSION_END=$(date -u -d "${SESSION_END_HM}" +%s)
+            CAP=$((START + CAP_MINUTES * 60))
             DEADLINE=$(( SESSION_END < CAP ? SESSION_END : CAP ))
             if [ "$START" -lt "$WINDOW_OPEN" ]; then echo "Before today's polling window - nothing to do."; exit 0; fi
           fi
@@ -67,8 +75,8 @@ jobs:
           n=0; fails=0; alert=0
           while [ "$(date -u +%s)" -lt "$DEADLINE" ]; do
             n=$((n + 1))
-            # env -u: orb_live_bot.py runs its smoke test whenever GITHUB_EVENT_NAME is
-            # workflow_dispatch - a looped manual test run must run the real check instead.
+            # env -u: the bot's __main__ runs its smoke test whenever GITHUB_EVENT_NAME is workflow_dispatch -
+            # a dispatch-started polling run must execute the real check instead.
             if env -u GITHUB_EVENT_NAME python orb_live_bot.py; then
               fails=0
             else
@@ -76,7 +84,9 @@ jobs:
               echo "::warning::check #$n failed ($fails in a row) - carrying on, the next poll retries"
               if [ "$fails" -ge 10 ]; then alert=1; fi
             fi
-            sleep "$POLL_SECONDS"
+            REMAINING=$((DEADLINE - $(date -u +%s)))
+            [ "$REMAINING" -le 0 ] && break
+            sleep $(( REMAINING < POLL_SECONDS ? REMAINING : POLL_SECONDS ))
           done
           echo "Polling window over after $n checks."
           if [ "$alert" -eq 1 ]; then
